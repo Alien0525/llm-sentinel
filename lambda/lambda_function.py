@@ -10,15 +10,13 @@ def lambda_handler(event, context):
         if not prompt:
             return {"statusCode": 400, "body": json.dumps({"error": "Prompt required"})}
 
-        if len(prompt) > 500:
-            return {"statusCode": 400, "body": json.dumps({"error": "Prompt too long"})}
-
         payload = json.dumps({
             "model": "tinyllama",
             "prompt": prompt,
             "stream": False,
             "options": {
-                "num_predict": 30
+                "num_predict": 30,
+                "temperature": 0.2
             }
         }).encode()
 
