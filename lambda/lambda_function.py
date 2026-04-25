@@ -1,4 +1,5 @@
 import json, urllib.request, os
+from dynamo_logger import log_attack
 
 EC2_URL = os.environ["OLLAMA_EC2_URL"]
 
@@ -6,7 +7,7 @@ def lambda_handler(event, context):
     try:
         body = json.loads(event.get("body", "{}"))
         prompt = body.get("prompt", "")
-
+        source_ip = event.get("requestContext", {}).get("identity", {}).get("sourceIp", "unknown")
         if not prompt:
             return {"statusCode": 400, "body": json.dumps({"error": "Prompt required"})}
 
@@ -29,6 +30,8 @@ def lambda_handler(event, context):
 
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.loads(r.read())
+
+        log_attack(prompt, "benign", "none", False, source_ip)
 
         return {
             "statusCode": 200,
