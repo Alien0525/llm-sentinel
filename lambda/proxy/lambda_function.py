@@ -13,8 +13,10 @@ logger.setLevel(logging.INFO)
 EC2_URL = os.environ["OLLAMA_EC2_URL"]
 GUARDRAIL_ID = os.environ["GUARDRAIL_ID"]
 GUARDRAIL_VERSION = os.environ.get("GUARDRAIL_VERSION", "1")
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))
+
+# Classifier Lambda (deployed from ECR image)
 CLASSIFIER_LAMBDA_ARN = os.environ.get("CLASSIFIER_LAMBDA_ARN")
-CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))  # default 1 hour
 
 bedrock = boto3.client("bedrock-runtime", region_name="us-east-2")
 lambda_client = boto3.client("lambda", region_name="us-east-2")
@@ -49,50 +51,32 @@ def publish_latency_metric(layer, duration_ms):
 
 
 # ── DynamoDB Prompt Cache ─────────────────────────────────────────────────────
-# Caches verdict (blocked/allowed) per unique prompt hash.
-# On cache hit: returns instantly without touching classifier, Bedrock, or EC2.
-# TTL: configurable via CACHE_TTL_SECONDS env var (default 1 hour).
-#
-# Why this matters:
-#   - Attackers often retry the same payload repeatedly → cache blocks them instantly
-#   - Repeated legitimate prompts skip all layer overhead → latency drops to <50ms
-#   - Addresses the mentor's caching + latency + scalability questions in one mechanism
 
 def get_prompt_hash(prompt):
-    """SHA-256 hash of the prompt — used as DynamoDB partition key."""
     return hashlib.sha256(prompt.strip().lower().encode()).hexdigest()
 
 def check_cache(prompt_hash):
-    """
-    Returns cached item if found and not expired, else None.
-    DynamoDB TTL attribute handles expiry automatically (AWS deletes expired rows).
-    """
     try:
         result = cache_table.get_item(Key={"prompt_hash": prompt_hash})
         item = result.get("Item")
-        if item:
-            # Double-check TTL in case AWS hasn't deleted it yet (can lag up to 48h)
-            if int(time.time()) < item.get("expires_at", 0):
-                logger.info(f"Cache HIT for hash {prompt_hash[:12]}...")
-                publish_latency_metric("CacheHit", 0)  # near-zero latency
-                return item
+        if item and int(time.time()) < item.get("expires_at", 0):
+            logger.info(f"Cache HIT for hash {prompt_hash[:12]}...")
+            return item
     except Exception as e:
         logger.warning(f"Cache read error (non-fatal): {str(e)}")
     return None
 
 def write_cache(prompt_hash, verdict, blocked_by, message, encoding):
-    """Store verdict in cache with TTL."""
     try:
         cache_table.put_item(Item={
             "prompt_hash": prompt_hash,
             "verdict": verdict,
             "blocked_by": blocked_by or "none",
-            "message": message[:500],           # truncate LLM responses
+            "message": message[:500],
             "encoding_detected": encoding or "none",
             "cached_at": int(time.time()),
-            "expires_at": int(time.time()) + CACHE_TTL_SECONDS  # DynamoDB TTL field
+            "expires_at": int(time.time()) + CACHE_TTL_SECONDS
         })
-        logger.info(f"Cache WRITE for hash {prompt_hash[:12]}... verdict={verdict}")
     except Exception as e:
         logger.warning(f"Cache write error (non-fatal): {str(e)}")
 
@@ -100,33 +84,24 @@ def write_cache(prompt_hash, verdict, blocked_by, message, encoding):
 # ── Encoded Payload Detection ─────────────────────────────────────────────────
 
 def decode_if_encoded(prompt):
-    """
-    Decode Base64 or hex-encoded payloads before classification.
-    Returns (decoded_prompt, encoding_type | None).
-    """
     stripped = prompt.strip()
-
-    # Try Base64
     if len(stripped) > 20:
         try:
             padded = stripped + "=" * (-len(stripped) % 4)
             decoded_bytes = base64.b64decode(padded, validate=True)
             decoded_text = decoded_bytes.decode("utf-8")
-            printable_ratio = sum(c.isprintable() for c in decoded_text) / len(decoded_text)
-            if printable_ratio > 0.85 and len(decoded_text) > 5:
+            if sum(c.isprintable() for c in decoded_text) / len(decoded_text) > 0.85:
                 logger.warning(f"Base64 payload detected. Decoded: {decoded_text[:60]}")
                 return decoded_text, "base64"
         except Exception:
             pass
 
-    # Try Hex
     hex_candidate = stripped.replace(" ", "").replace("0x", "")
     if len(hex_candidate) >= 20 and len(hex_candidate) % 2 == 0:
         try:
             decoded_bytes = bytes.fromhex(hex_candidate)
             decoded_text = decoded_bytes.decode("utf-8")
-            printable_ratio = sum(c.isprintable() for c in decoded_text) / len(decoded_text)
-            if printable_ratio > 0.85 and len(decoded_text) > 5:
+            if sum(c.isprintable() for c in decoded_text) / len(decoded_text) > 0.85:
                 logger.warning(f"Hex payload detected. Decoded: {decoded_text[:60]}")
                 return decoded_text, "hex"
         except Exception:
@@ -135,12 +110,9 @@ def decode_if_encoded(prompt):
     return prompt, None
 
 
-# ── Layer 1 — ML Classifier ───────────────────────────────────────────────────
+# ── Layer 1 — ML Classifier (Krisha's containerised TF-IDF model) ─────────────
 
 def check_layer1(prompt):
-    if not CLASSIFIER_LAMBDA_ARN:
-        logger.info("Layer1: skipped (not deployed)")
-        return {"blocked": False, "reason": "Layer1 not deployed"}
     try:
         response = lambda_client.invoke(
             FunctionName=CLASSIFIER_LAMBDA_ARN,
@@ -155,7 +127,7 @@ def check_layer1(prompt):
         return {"blocked": False, "reason": f"Layer1 error: {str(e)}"}
 
 
-# ── Layer 2 — Bedrock Guardrails ──────────────────────────────────────────────
+# ── Layer 2 — Bedrock Guardrails (input semantic check) ───────────────────────
 
 def check_layer2(prompt):
     response = bedrock.apply_guardrail(
@@ -189,6 +161,30 @@ def query_llm(prompt):
         return json.loads(r.read()).get("response", "")
 
 
+# ── Layer 3 — Bedrock Guardrails (output / egress audit) ─────────────────────
+# Varsha's Week 4 task: applied to LLM response before returning to user.
+# Prevents TinyLlama from leaking system prompt content, PII, or secrets
+# even if the input guardrails were bypassed somehow.
+
+def check_layer3(llm_response):
+    try:
+        response = bedrock.apply_guardrail(
+            guardrailIdentifier=GUARDRAIL_ID,
+            guardrailVersion=GUARDRAIL_VERSION,
+            source="OUTPUT",                        # OUTPUT mode — audits the response
+            content=[{"text": {"text": llm_response}}]
+        )
+        blocked = response["action"] == "GUARDRAIL_INTERVENED"
+        reason = response.get("outputs", [{}])[0].get("text", "") if blocked else ""
+        logger.info(f"Layer3: blocked={blocked} reason={reason}")
+        return {"blocked": blocked, "reason": reason}
+    except Exception as e:
+        logger.error(f"Layer3 error: {str(e)}")
+        # Non-fatal: if egress check fails, still return the response
+        # but log it for investigation
+        return {"blocked": False, "reason": f"Layer3 error: {str(e)}"}
+
+
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
@@ -202,7 +198,7 @@ def lambda_handler(event, context):
 
         logger.info(f"Incoming prompt: {prompt[:100]} | baseline_mode={baseline_mode}")
 
-        # ── Baseline path: straight to TinyLlama, bypass all layers + cache ──
+        # ── Baseline: straight to TinyLlama, no layers, no cache ─────────────
         if baseline_mode:
             logger.info("BASELINE MODE: skipping all guardrail layers and cache")
             t0 = time.time()
@@ -211,9 +207,6 @@ def lambda_handler(event, context):
             return respond(200, "baseline", None, llm_response, encoding=None, cached=False)
 
         # ── Cache check ───────────────────────────────────────────────────────
-        # Hash on the raw prompt so encoded variants get their own cache entry.
-        # A blocked Base64 payload won't incorrectly serve a cached "allowed"
-        # response for a different prompt that happens to decode the same way.
         prompt_hash = get_prompt_hash(prompt)
         t_cache = time.time()
         cached = check_cache(prompt_hash)
@@ -231,13 +224,10 @@ def lambda_handler(event, context):
                 cached=True
             )
 
-        # ── Decode encoded payloads ───────────────────────────────────────────
+        # ── Decode encoded payloads before classification ─────────────────────
         t_decode = time.time()
         decoded_prompt, encoding_detected = decode_if_encoded(prompt)
         publish_latency_metric("Decode", (time.time() - t_decode) * 1000)
-
-        if encoding_detected:
-            logger.warning(f"Encoding={encoding_detected} | Classifying decoded content")
 
         # ── Layer 1 — ML classifier ───────────────────────────────────────────
         t1 = time.time()
@@ -249,7 +239,7 @@ def lambda_handler(event, context):
             write_cache(prompt_hash, "blocked", "Layer1", l1["reason"], encoding_detected)
             return respond(403, "blocked", "Layer1", l1["reason"], encoding=encoding_detected, cached=False)
 
-        # ── Layer 2 — Bedrock Guardrails ──────────────────────────────────────
+        # ── Layer 2 — Bedrock Guardrails (input) ──────────────────────────────
         t2 = time.time()
         l2 = check_layer2(decoded_prompt)
         publish_latency_metric("Layer2_Bedrock", (time.time() - t2) * 1000)
@@ -260,12 +250,23 @@ def lambda_handler(event, context):
             return respond(403, "blocked", "Layer2", l2["reason"], encoding=encoding_detected, cached=False)
 
         # ── EC2 / TinyLlama ───────────────────────────────────────────────────
-        logger.info("Prompt passed all layers, querying LLM")
+        logger.info("Prompt passed input layers, querying LLM")
         t3 = time.time()
         llm_response = query_llm(prompt)
         publish_latency_metric("EC2_TinyLlama", (time.time() - t3) * 1000)
 
-        # Cache allowed responses too — repeat legitimate prompts skip all layers
+        # ── Layer 3 — Bedrock Guardrails (output / egress audit) ──────────────
+        t4 = time.time()
+        l3 = check_layer3(llm_response)
+        publish_latency_metric("Layer3_Egress", (time.time() - t4) * 1000)
+
+        if l3["blocked"]:
+            publish_block_metric("Layer3")
+            # Do NOT cache a blocked egress — the input was fine, only output was unsafe
+            # Next time the same prompt should still reach TinyLlama and get a fresh response
+            return respond(403, "blocked", "Layer3", l3["reason"], encoding=encoding_detected, cached=False)
+
+        # All layers passed — cache and return
         write_cache(prompt_hash, "allowed", None, llm_response, encoding_detected)
         return respond(200, "allowed", None, llm_response, encoding=encoding_detected, cached=False)
 
@@ -282,7 +283,7 @@ def respond(status, verdict, blocked_by, message, encoding=None, cached=False):
             "verdict": verdict,
             "blocked_by": blocked_by,
             "encoding_detected": encoding,
-            "cached": cached,           # tells you instantly if cache is working
+            "cached": cached,
             "message": message
         })
     }
