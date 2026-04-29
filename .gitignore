@@ -1,0 +1,39 @@
+# Environment variables — never commit
+.env
+.env.*
+!.env.example
+
+# AWS credentials
+.aws/
+credentials
+
+# Python
+__pycache__/
+*.py[cod]
+*.pkl
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ML model artifacts
+model.pkl
+*.joblib
+data/
+
+# Docker
+*.tar
+
+# Logs
+*.log
+logs/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
