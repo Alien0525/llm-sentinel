@@ -191,7 +191,7 @@ def check_layer2(prompt):
 def query_llm(prompt):
     payload = json.dumps({
         "model": "tinyllama", "prompt": prompt, "stream": False,
-        "options": {"num_predict": 30, "temperature": 0.2}
+        "options": {"num_predict": 80, "temperature": 0.2}
     }).encode()
     req = urllib.request.Request(
         f"{EC2_URL}/api/generate", data=payload,
@@ -223,6 +223,16 @@ def check_layer3(llm_response):
 # ── Handler ───────────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
+    if event.get("requestContext", {}).get("http", {}).get("method") == "OPTIONS":
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Access-Control-Allow-Origin":  "*",
+                "Access-Control-Allow-Headers": "content-type",
+                "Access-Control-Allow-Methods": "POST, OPTIONS"
+            },
+            "body": ""
+        }
     try:
         body          = json.loads(event.get("body", "{}"))
         prompt        = body.get("prompt", "")
@@ -328,7 +338,12 @@ def lambda_handler(event, context):
 def respond(status, verdict, blocked_by, message, encoding=None, cached=False):
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Headers": "content-type",
+            "Access-Control-Allow-Methods": "POST, OPTIONS"
+        },
         "body": json.dumps({
             "verdict":           verdict,
             "blocked_by":        blocked_by,
