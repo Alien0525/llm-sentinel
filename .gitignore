@@ -1,13 +1,19 @@
-# Environment variables — never commit
+# -------------------------
+# Environment variables
+# -------------------------
 .env
 .env.*
 !.env.example
 
+# -------------------------
 # AWS credentials
+# -------------------------
 .aws/
 credentials
 
+# -------------------------
 # Python
+# -------------------------
 __pycache__/
 *.py[cod]
 *.pkl
@@ -18,22 +24,42 @@ build/
 venv/
 env/
 
-# ML model artifacts
+# -------------------------
+# ML / Embeddings / Layers
+# -------------------------
+fastembed-layer/*
+!fastembed-layer/.gitkeep
+*.zip
+*.onnx
+*.bin
+*.pt
+
+# -------------------------
+# Model / data artifacts
+# -------------------------
 model.pkl
 *.joblib
 data/
 
+# -------------------------
 # Docker
+# -------------------------
 *.tar
 
+# -------------------------
 # Logs
+# -------------------------
 *.log
 logs/
 
+# -------------------------
 # macOS
+# -------------------------
 .DS_Store
 
+# -------------------------
 # IDE
+# -------------------------
 .vscode/
 .idea/
 *.swp
