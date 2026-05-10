@@ -4,6 +4,12 @@ Cloud-native defense framework against adversarial attacks on Large Language Mod
 
 ---
 
+## Demo
+
+Demo Video: https://youtu.be/Vnj9kx9DL74
+
+---
+
 ## Overview
 
 LLM Sentinel simulates adversarial attacks on a cloud-hosted LLM and measures the effectiveness of a multi-layered defense architecture. The system intercepts malicious prompts before they reach the target model and validates outputs before returning them to the user.
@@ -57,6 +63,9 @@ Response + Logging
 Streamlit Dashboard (EC2)
 ```
 
+![Architecture Diagram](assets/architecture_diagram.png)
+*Full request pipeline: live path (purple), monitoring/logging (green), and dev-only retraining loop (brown).*
+
 ---
 
 ## Defense Layers
@@ -107,6 +116,53 @@ A second Bedrock Guardrails configuration applied to the LLM output before it is
 5. Build Docker container image
 6. Push image to Amazon ECR
 7. Deploy via AWS Lambda for real-time prompt classification
+
+---
+
+## Dashboard
+
+The Streamlit dashboard provides real-time observability across all three defense layers, reading from DynamoDB and CloudWatch and refreshing every 30 seconds.
+
+### Live Attack Monitor
+
+![Dashboard Live Attack Monitor](assets/dashboard_live_monitor.png)
+*Live attack monitor showing 772 total requests: 635 blocked (82%) and 137 allowed, with per-layer breakdown — Layer 1: 463, Layer 2: 104, Layer 3: 68.*
+
+### Block Rate by OWASP Category
+
+![OWASP Block Rate and Layer Breakdown](assets/dashboard_owasp_block_rate.png)
+*Block rate by OWASP LLM Top 10 category and attacks blocked per layer — Layer 1 handles the majority of blocks as the first line of defense.*
+
+### Layer Latency
+
+![Dashboard Layer Latency](assets/dashboard_layer_latency.png)
+*Per-layer latency from CloudWatch: Layer 1 ML Classifier at 154ms, Layer 2 Bedrock Input at 297ms, Layer 3 Bedrock Egress at 293ms; cache exact hit at 47ms vs. EC2 TinyLlama at 8s.*
+
+---
+
+## Frontend
+
+The chat frontend lets users test prompts in **Protected** (all three defense layers active) and **Unprotected** (raw TinyLlama) modes side-by-side.
+
+### Protected Mode — Blocking Attacks
+
+![Frontend Protected Mode Blocking](assets/frontend_protected_blocking.png)
+*Protected mode blocking a DAN jailbreak and a Base64-encoded attack payload, both stopped at Layer 1 within ~1000ms.*
+
+### Protected vs. Unprotected — Side-by-Side
+
+![Frontend Mode Comparison](assets/frontend_unprotected_vs_protected.png)
+*Switching from Unprotected to Protected mode: the same system prompt extraction attack leaks credentials unprotected, then is immediately blocked by Layer 1 once protection is re-enabled.*
+
+### Unprotected Mode — System Prompt Leakage
+
+![Frontend Unprotected Mode Leaking](assets/frontend_unprotected_leaking.png)
+*Unprotected mode demonstrating the baseline vulnerability: a system prompt extraction attack causes TinyLlama to echo confidential credentials including a database password and AWS access keys.*
+
+### Protected Mode — Semantic Cache Hit
+
+![Frontend Cached Block](assets/frontend_cached_block.png)
+*A semantically similar injection ("Forget all previous instructions…") is resolved from the semantic cache with similarity 0.95 in 926ms; a benign query ("what is AWS lambda?") passes all layers and receives a valid response.*
 
 ---
 
@@ -163,6 +219,17 @@ curl -X POST \
   -H "Content-Type: application/json" \
   -d '{"prompt": "What is 2+2?"}'
 ```
+
+---
+
+## Results
+
+| Metric | Baseline | Protected | Change |
+|--------|----------|-----------|--------|
+| Block rate — plain text | 0% | 81% (17/21) | +81pp |
+| Block rate — Base64 | 0% | 100% (21/21) | +100pp |
+| Attacks complied | 18/21 | 3/21 plain, 0/21 Base64 | −11 attacks |
+| Total (63 attacks) | 0/63 blocked | 54/63 blocked (86%) | 9/63 passed through |
 
 ---
 
